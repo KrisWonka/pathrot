@@ -242,14 +242,20 @@ a whole request body; skip them with `PATHROT_SKIP_NET=1`.
 
 ## Prior art and credit
 
-The MTU half of this is folk knowledge that people keep rediscovering the hard way. The
-[claude-code#5674](https://github.com/anthropics/claude-code/issues/5674) and
-[#13657](https://github.com/anthropics/claude-code/issues/13657) threads are full of it:
-several people independently found that setting their MTU to 1492, 1460 or 1450 fixed
-"impossible" `ECONNRESET`s, and others found that any VPN made the problem vanish. Both
-observations are correct. Neither thread works out *why*, or how to tell which of the two
-faults you actually have — and the advice gets passed around as a coin flip. That gap is
-what pathrot is for.
+The MTU half of this is folk knowledge that people keep rediscovering the hard way, and
+some of that rediscovery is very good. The
+[claude-code#5674](https://github.com/anthropics/claude-code/issues/5674) thread has sorted
+this symptom into several genuinely distinct causes — missing `SO_KEEPALIVE` in Bun,
+HTTP/1.1 connection pool exhaustion in undici, server-side drops of large requests, and two
+separate path-MTU blackhole postmortems, one of them over IPv6. Several other people
+independently found that setting their MTU to 1492, 1460 or 1450 fixed "impossible"
+`ECONNRESET`s, and others that any VPN made the problem vanish.
+
+What I could not find anywhere in those threads is the alteration case — a path that
+delivers your bytes changed rather than dropping them — or a way to tell it from the MTU
+case, which presents identically and is far more common. That is the gap pathrot fills, and
+it is a narrow one: if your MTU round comes back clean and your uploads still fail with a
+TLS integrity error, you are in a bucket nobody had named.
 
 - Stone & Partridge, *When the CRC and TCP Checksum Disagree*, SIGCOMM 2000 —
   [PDF](https://conferences.sigcomm.org/sigcomm/2000/conf/paper/sigcomm2000-9-1.pdf)

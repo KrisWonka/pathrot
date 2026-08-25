@@ -205,8 +205,8 @@ ping_df() {
       if [ -n "$PING_SRC" ]; then ping -c 2 -W 2000 -D -S "$PING_SRC" -s "$1" "$2" >/dev/null 2>&1
       else                        ping -c 2 -W 2000 -D               -s "$1" "$2" >/dev/null 2>&1; fi ;;
     Linux)
-      if [ -n "$PING_SRC" ]; then ping -c 2 -W 2 -M do -I "$PING_SRC" -s "$1" "$2" >/dev/null 2>&1
-      else                        ping -c 2 -W 2 -M do                -s "$1" "$2" >/dev/null 2>&1; fi ;;
+      if [ -n "$PING_SRC" ]; then ping -c 2 -W 2 -M 'do' -I "$PING_SRC" -s "$1" "$2" >/dev/null 2>&1
+      else                        ping -c 2 -W 2 -M 'do'                -s "$1" "$2" >/dev/null 2>&1; fi ;;
     *) return 2 ;;
   esac
 }
