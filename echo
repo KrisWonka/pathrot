@@ -1,0 +1,4 @@
+Error: Exit code 128
+fatal: ambiguous argument '=== LICENSE ===': unknown revision or path not in the working tree.
+Use '--' to separate paths from revisions, like this:
+'git <command> [<revision>...] -- [<file>...]'

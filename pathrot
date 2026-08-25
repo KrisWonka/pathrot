@@ -11,7 +11,7 @@
 #
 # pathrot drives that failure on purpose and attributes it to a layer.
 #
-# MIT licensed. https://github.com/OWNER/pathrot
+# MIT licensed. https://github.com/KrisWonka/pathrot
 
 set -uo pipefail
 
