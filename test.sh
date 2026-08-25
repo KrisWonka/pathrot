@@ -55,6 +55,21 @@ case "$IFACE" in
 esac
 echo
 
+echo "─ MTU blackhole"
+# The most commonly confirmed cause of this symptom. It must be reported even
+# when every upload succeeds, and it must not be confused with a tunnel's own
+# 1280-byte MTU (that confound cost an hour during development).
+expect_exit 1 "exits 1 on an MTU blackhole with clean uploads" \
+  env PATHROT_FAKE='............' PATHROT_FAKE_MTU=1400 ./pathrot -q
+expect_out "path MTU blackhole" "names the blackhole"
+expect_out "Lower your MTU first" "leads with the cheap local fix"
+expect_no_out "path looks clean" "does not call a blackholed path clean"
+
+expect_exit 1 "corruption plus a blackhole reports both" \
+  env PATHROT_FAKE='..!.!.......' PATHROT_FAKE_MTU=1400 ./pathrot -q
+expect_out "will not fix the corruption" "warns that lowering MTU will not fix corruption"
+echo
+
 echo "─ clean path"
 expect_exit 0 "exits 0 when nothing fails" env PATHROT_FAKE='............' ./pathrot -q
 expect_out "path looks clean" "reports a clean verdict"

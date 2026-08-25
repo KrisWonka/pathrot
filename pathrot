@@ -1,40 +1,49 @@
 #!/usr/bin/env bash
-# pathrot — does this network path silently corrupt the bytes you send?
+# pathrot — is this network path losing your large packets, or altering them?
 #
-# ping/mtr/iperf answer "did the packet arrive, and how fast".
-# None of them answer "did my bytes arrive unchanged", because everyone
-# assumes TCP guarantees that. On some paths it does not: a middlebox that
-# rewrites addresses must recompute the TCP checksum, so if it also damages
-# the payload, the checksum it writes is self-consistent with the damaged
-# bytes and the receiver cannot tell. TLS then catches it -- and, having no
-# way to ask for a retransmit, kills the whole connection.
+# Two different faults produce the same symptom (intermittent ECONNRESET on
+# large uploads while everything else looks perfect), and they have different
+# fixes, so guessing between them wastes days:
 #
-# pathrot drives that failure on purpose and attributes it to a layer.
+#   path MTU blackhole  large packets are DROPPED       fix: lower your MTU
+#   path corruption     large packets are ALTERED       fix: tunnel out
+#
+# The second one is the nasty one. A middlebox that rewrites addresses must
+# recompute the TCP checksum, so if it also damages the payload the checksum it
+# writes is self-consistent with the damage and nothing below TLS can tell.
+# TLS then catches it and, with nothing left to retransmit, kills the whole
+# connection.
+#
+# pathrot measures both and tells you which one you have.
 #
 # MIT licensed. https://github.com/KrisWonka/pathrot
 
 set -uo pipefail
 
-VERSION=0.2.0
+VERSION=0.3.0
 
 # ---------------------------------------------------------------- defaults --
 
 PRIMARY_URL=${PATHROT_URL:-https://speed.cloudflare.com/__up}
 SECOND_URL=${PATHROT_URL2:-https://httpbin.org/post}
 DOWN_URL=${PATHROT_DOWN_URL:-https://speed.cloudflare.com/__down?bytes=20000000}
+PING_TARGETS=${PATHROT_PING_TARGETS:-"1.1.1.1 8.8.8.8"}
 
-SAMPLES=12          # uploads per probe round
-PAYLOAD_KB=512      # size of each upload
-SLOW_RATE=150k      # rate cap used for the burst-vs-constant test
-TIMEOUT=45          # per-request timeout, seconds
-LAN_PEER=""         # optional ssh target on the local network
+SAMPLES=12
+PAYLOAD_KB=512
+SLOW_RATE=150k
+TIMEOUT=45
+LAN_PEER=""
 JSON=0
 
 # ------------------------------------------------------------------- usage --
 
 usage() {
   cat <<EOF
-pathrot $VERSION — detect a network path that silently corrupts your uploads
+pathrot $VERSION — tell a path-MTU blackhole apart from a path that corrupts data
+
+Both show up as intermittent ECONNRESET on large uploads while ping, speed
+tests and small requests all look fine. They need opposite fixes.
 
 USAGE
   pathrot [options]
@@ -56,10 +65,11 @@ ENVIRONMENT
                       whole body; pathrot verifies this before probing.
   PATHROT_URL2        second endpoint, used to rule out the peer
   PATHROT_DOWN_URL    download endpoint for the baseline
+  PATHROT_PING_TARGETS  hosts to size the path MTU against
 
 EXIT STATUS
   0  path looks clean
-  1  path is damaging or dropping your uploads
+  1  a fault was found (MTU blackhole, corruption, or unexplained resets)
   2  could not run a valid test (bad endpoint, no connectivity, bad usage)
 
 Each probe uploads random bytes to a public speed-test endpoint. With the
@@ -121,8 +131,6 @@ head -c "$PAYLOAD_BYTES" /dev/urandom > "$PAYLOAD" 2>/dev/null || \
   dd if=/dev/urandom of="$PAYLOAD" bs=1024 count="$PAYLOAD_KB" 2>/dev/null || \
   { echo "pathrot: could not generate payload" >&2; exit 2; }
 
-# The rate-capped round needs a timeout that fits the cap, or every probe
-# times out and the burst-vs-constant question gets answered by the clock.
 rate_bytes() {
   case "$1" in
     *[kK]) echo $(( ${1%[kK]} * 1024 )) ;;
@@ -139,14 +147,87 @@ else
   SLOW_TIMEOUT=$TIMEOUT
 fi
 
+# ------------------------------------------------------- physical interface --
+
+# Deliberately NOT the default route's interface: when a tunnel is up the
+# default route points at the tunnel, and probing through it would measure the
+# tunnel instead of the link underneath. (A tunnel's own MTU is typically 1280,
+# which looks exactly like a blackhole if you forget this.)
+phys_iface() {
+  local i=""
+  case "$(uname -s)" in
+    Darwin)
+      i=$(route -n get 1.1.1.1 2>/dev/null | awk '/interface:/{print $2; exit}')
+      case "$i" in utun*|tun*|tap*|wg*|ppp*|feth*|ipsec*|"") i="" ;; esac
+      [ -n "$i" ] || i=$(ifconfig 2>/dev/null | awk '
+        /^en[0-9]+:/ { ifc = substr($1, 1, length($1)-1) }
+        /^[ \t]+inet / { if (ifc != "" && $2 !~ /^127\./) { print ifc; exit } }')
+      ;;
+    Linux)
+      i=$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)
+      case "$i" in utun*|tun*|tap*|wg*|ppp*|tailscale*|"") i="" ;; esac
+      [ -n "$i" ] || i=$(ip -o -4 addr show scope global 2>/dev/null |
+        awk '$2 !~ /^(lo|tun|tap|wg|utun|tailscale|docker|veth)/ { print $2; exit }')
+      ;;
+  esac
+  echo "$i"
+}
+
+iface_ip() {
+  [ -n "$1" ] || return 1
+  case "$(uname -s)" in
+    Darwin) ipconfig getifaddr "$1" 2>/dev/null ;;
+    Linux)  ip -o -4 addr show dev "$1" 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}' ;;
+  esac
+}
+
+iface_mtu() {
+  [ -n "$1" ] || return 1
+  case "$(uname -s)" in
+    Darwin) ifconfig "$1" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="mtu"){print $(i+1); exit}}' ;;
+    Linux)  ip link show "$1" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="mtu"){print $(i+1); exit}}' ;;
+  esac
+}
+
+tunnel_active() {
+  command -v tailscale >/dev/null 2>&1 || return 1
+  tailscale debug prefs 2>/dev/null | grep -q '"ExitNodeID": "[^"]\{1,\}"'
+}
+
+# ------------------------------------------------------------- path MTU ----
+
+PING_SRC=""
+# ping_df <payload_bytes> <target> — one ICMP echo with don't-fragment set,
+# sourced from the physical interface so an active tunnel is bypassed.
+ping_df() {
+  case "$(uname -s)" in
+    Darwin)
+      if [ -n "$PING_SRC" ]; then ping -c 2 -W 2000 -D -S "$PING_SRC" -s "$1" "$2" >/dev/null 2>&1
+      else                        ping -c 2 -W 2000 -D               -s "$1" "$2" >/dev/null 2>&1; fi ;;
+    Linux)
+      if [ -n "$PING_SRC" ]; then ping -c 2 -W 2 -M do -I "$PING_SRC" -s "$1" "$2" >/dev/null 2>&1
+      else                        ping -c 2 -W 2 -M do                -s "$1" "$2" >/dev/null 2>&1; fi ;;
+    *) return 2 ;;
+  esac
+}
+
+# path_mtu <target> -> bytes, or empty if ICMP is unusable here
+path_mtu() {
+  local t=$1 lo hi mid
+  ping_df 56 "$t" || return 1          # control: is ICMP answered at all?
+  if ping_df 1472 "$t"; then echo 1500; return 0; fi
+  lo=56; hi=1472
+  while [ $((hi - lo)) -gt 4 ]; do
+    mid=$(( (lo + hi) / 2 ))
+    if ping_df "$mid" "$t"; then lo=$mid; else hi=$mid; fi
+  done
+  echo $((lo + 28))
+}
+
 # ------------------------------------------------------------------- probes --
 
 # upload_once [extra curl args...] -> one verdict token
-#   ok       the whole body was accepted with a 2xx
-#   corrupt  the peer rejected a TLS record's integrity tag
-#   reset    the connection died, with no decodable integrity error
-#   timeout  too slow, not necessarily damaged
-#   invalid  the endpoint did not consume the body — the probe proves nothing
+#   ok | corrupt | reset | timeout | invalid
 #
 # PATHROT_FAKE is a test seam: a string of verdict characters replayed in place
 # of real probes (. ok, ! corrupt, r reset, ~ timeout, i invalid). Used by
@@ -154,17 +235,13 @@ fi
 PROBE_TIMEOUT=$TIMEOUT
 upload_once() {
   if [ -n "${PATHROT_FAKE:-}" ]; then
-    # the counter lives in a file because callers run this in a subshell
     local n=${#PATHROT_FAKE} i ch cf="$TMPDIR_/fake.i"
     i=$(cat "$cf" 2>/dev/null || echo 0)
     ch=${PATHROT_FAKE:$((i % n)):1}
     echo $((i + 1)) > "$cf"
     case "$ch" in
-      '!') echo corrupt ;;
-      'r') echo reset ;;
-      '~') echo timeout ;;
-      'i') echo invalid ;;
-      *)   echo ok ;;
+      '!') echo corrupt ;; 'r') echo reset ;; '~') echo timeout ;;
+      'i') echo invalid ;; *) echo ok ;;
     esac
     return
   fi
@@ -189,8 +266,6 @@ upload_once() {
   fi
   [ "$rc" -eq 28 ] && { echo timeout; return; }
 
-  # Different TLS stacks word this differently; match them all, and treat a
-  # connection that merely died as a weaker but still real signal.
   if grep -qiE 'bad record mac|bad_record_mac|decryption failed|digest failure|DECRYPT_ERROR|record overflow|unexpected length' "$ERRF"; then
     echo corrupt
   else
@@ -198,8 +273,6 @@ upload_once() {
   fi
 }
 
-# run_round <label> [extra curl args...]
-# sets RD_OK RD_CORRUPT RD_RESET RD_TIMEOUT RD_INVALID RD_TOTAL
 run_round() {
   local label=$1; shift
   RD_OK=0; RD_CORRUPT=0; RD_RESET=0; RD_TIMEOUT=0; RD_INVALID=0; RD_TOTAL=$SAMPLES
@@ -222,44 +295,18 @@ run_round() {
 
 pct() { [ "$2" -eq 0 ] && { echo 0; return; }; echo $(( $1 * 100 / $2 )); }
 
-# ------------------------------------------------------- physical interface --
-
-# Deliberately NOT the default route's interface: when a tunnel is up the
-# default route points at the tunnel, and probing through it would measure the
-# tunnel instead of the link underneath.
-phys_iface() {
-  local i=""
-  case "$(uname -s)" in
-    Darwin)
-      i=$(route -n get 1.1.1.1 2>/dev/null | awk '/interface:/{print $2; exit}')
-      case "$i" in utun*|tun*|tap*|wg*|ppp*|feth*|ipsec*|"") i="" ;; esac
-      [ -n "$i" ] || i=$(ifconfig 2>/dev/null | awk '
-        /^en[0-9]+:/ { ifc = substr($1, 1, length($1)-1) }
-        /^[ \t]+inet / { if (ifc != "" && $2 !~ /^127\./) { print ifc; exit } }')
-      ;;
-    Linux)
-      i=$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)
-      case "$i" in utun*|tun*|tap*|wg*|ppp*|tailscale*|"") i="" ;; esac
-      [ -n "$i" ] || i=$(ip -o -4 addr show scope global 2>/dev/null |
-        awk '$2 !~ /^(lo|tun|tap|wg|utun|tailscale|docker|veth)/ { print $2; exit }')
-      ;;
-  esac
-  echo "$i"
-}
-
-tunnel_active() {
-  command -v tailscale >/dev/null 2>&1 || return 1
-  tailscale debug prefs 2>/dev/null | grep -q '"ExitNodeID": "[^"]\{1,\}"'
-}
-
 # ---------------------------------------------------------------------------
 
 say ""
 say "${B}pathrot $VERSION${Z}  ${DIM}$SAMPLES × ${PAYLOAD_KB}KB uploads per round${Z}"
 say ""
 
+PHYS=$(phys_iface)
+PING_SRC=$(iface_ip "$PHYS")
+IF_MTU=$(iface_mtu "$PHYS")
+
 # --- 1. baseline, and prove the endpoint is usable --------------------------
-say "${B}[1/6]${Z} baseline — is the endpoint usable at all?"
+say "${B}[1/7]${Z} baseline — is the endpoint usable at all?"
 if [ -n "${PATHROT_FAKE:-}" ]; then
   CONNECT_MS=10; TLS_MS=20; DOWN_MBPS=14.2
 else
@@ -268,25 +315,50 @@ else
   [ -n "$BASE" ] || die "  cannot reach $PRIMARY_URL — check basic connectivity first"
   CONNECT_MS=$(echo "$BASE" | awk '{printf "%.0f", $1*1000}')
   TLS_MS=$(echo "$BASE" | awk '{printf "%.0f", $2*1000}')
-
-  # One slow upload. It must succeed, or nothing measured later means anything:
-  # rate-capped so that a genuinely rotten path still lets it through.
   PROBE_TIMEOUT=$SLOW_TIMEOUT
   VERIFY=$(upload_once --limit-rate "$SLOW_RATE" "$PRIMARY_URL")
   PROBE_TIMEOUT=$TIMEOUT
-  if [ "$VERIFY" = "invalid" ]; then
-    die "  $PRIMARY_URL did not accept the full ${PAYLOAD_KB}KB body.
+  [ "$VERIFY" = "invalid" ] && die "  $PRIMARY_URL did not accept the full ${PAYLOAD_KB}KB body.
   pathrot needs an endpoint that POSTs and reads the whole request.
   Set PATHROT_URL to one you control, or check the default is still alive."
-  fi
   DOWN_BPS=$(curl -sS -o /dev/null --max-time 60 -w '%{speed_download}' "$DOWN_URL" 2>/dev/null)
   DOWN_MBPS=$(echo "${DOWN_BPS:-0}" | awk '{printf "%.1f", $1/1048576}')
 fi
 say "  ${G}ok${Z}  tcp ${CONNECT_MS}ms · tls ${TLS_MS}ms · download ${DOWN_MBPS} MB/s · endpoint accepts full uploads"
 say ""
 
-# --- 2. full-speed uploads --------------------------------------------------
-say "${B}[2/6]${Z} full-speed uploads → is anything damaging them?"
+# --- 2. path MTU ------------------------------------------------------------
+# The most commonly confirmed cause of this symptom, and the cheapest to fix,
+# so it goes before anything expensive. Probed from the physical interface so
+# a tunnel's own 1280-byte MTU is not mistaken for a blackhole.
+say "${B}[2/7]${Z} path MTU — are large packets being dropped outright?"
+MTU_STATE=unknown; PATH_MTU=""
+if [ -n "${PATHROT_FAKE_MTU:-}" ]; then
+  PATH_MTU=$PATHROT_FAKE_MTU; IF_MTU=${IF_MTU:-1500}
+elif [ -n "${PATHROT_FAKE:-}" ]; then
+  PATH_MTU=1500; IF_MTU=${IF_MTU:-1500}
+else
+  for t in $PING_TARGETS; do
+    PATH_MTU=$(path_mtu "$t") && break || PATH_MTU=""
+  done
+fi
+if [ -z "$PATH_MTU" ]; then
+  MTU_STATE=unknown
+  say "  ${Y}ICMP is blocked here — cannot size the path MTU${Z}"
+  say "  ${DIM}If the uploads below fail, try lowering your MTU by hand anyway:"
+  say "  macOS  sudo networksetup -setMTU Wi-Fi 1400    Linux  sudo ip link set $PHYS mtu 1400${Z}"
+elif [ -n "$IF_MTU" ] && [ "$PATH_MTU" -lt "$IF_MTU" ]; then
+  MTU_STATE=blackhole
+  say "  ${R}path MTU is ${PATH_MTU}, your $PHYS is set to ${IF_MTU}${Z}"
+  say "  ${DIM}packets between those sizes are being dropped with nothing sent back${Z}"
+else
+  MTU_STATE=ok
+  say "  ${G}ok${Z}  path MTU ${PATH_MTU} on $PHYS (interface ${IF_MTU:-?}) — no blackhole"
+fi
+say ""
+
+# --- 3. full-speed uploads --------------------------------------------------
+say "${B}[3/7]${Z} full-speed uploads → is anything damaging them?"
 run_round "primary  " "$PRIMARY_URL"
 FULL_CORRUPT=$RD_CORRUPT; FULL_RESET=$RD_RESET; FULL_TOTAL=$RD_TOTAL
 FULL_TIMEOUT=$RD_TIMEOUT; FULL_INVALID=$RD_INVALID
@@ -294,34 +366,40 @@ FULL_BAD=$((FULL_CORRUPT + FULL_RESET))
 FULL_PCT=$(pct "$FULL_BAD" "$FULL_TOTAL")
 say ""
 
-if [ "$FULL_INVALID" -gt $((FULL_TOTAL / 2)) ]; then
+[ "$FULL_INVALID" -gt $((FULL_TOTAL / 2)) ] && \
   die "  most probes were invalid — the endpoint stopped consuming the body.
   Results would be meaningless; set PATHROT_URL to a server you control."
-fi
 
-if [ "$FULL_BAD" -eq 0 ]; then
-  say "${B}verdict${Z}  ${G}path looks clean${Z} — 0/$FULL_TOTAL uploads failed"
+if [ "$FULL_BAD" -eq 0 ] && [ "$MTU_STATE" != blackhole ]; then
+  say "${B}verdict${Z}  ${G}path looks clean${Z} — 0/$FULL_TOTAL uploads failed, no MTU blackhole"
   [ "$FULL_TIMEOUT" -gt 0 ] && \
     say "  ${DIM}($FULL_TIMEOUT timed out — the link is slow, but not damaging data)${Z}"
   say ""
   say "  ${DIM}This fault is intermittent. If your application is failing right now"
   say "  and this run is clean, re-run with -n 32 to sample a longer window.${Z}"
-  [ "$JSON" -eq 1 ] && printf '{"verdict":"clean","corrupt":0,"reset":0,"samples":%d}\n' "$FULL_TOTAL"
+  [ "$JSON" -eq 1 ] && printf '{"verdict":"clean","mtu":"%s","path_mtu":"%s","corrupt":0,"reset":0,"samples":%d}\n' \
+    "$MTU_STATE" "$PATH_MTU" "$FULL_TOTAL"
   exit 0
 fi
 
 if [ "$FULL_CORRUPT" -gt 0 ]; then
   KIND=corruption
   say "  ${R}$FULL_BAD/$FULL_TOTAL failed (${FULL_PCT}%)${Z} — $FULL_CORRUPT with a TLS integrity error"
-else
+elif [ "$FULL_BAD" -gt 0 ]; then
   KIND=resets
   say "  ${R}$FULL_BAD/$FULL_TOTAL failed (${FULL_PCT}%)${Z} — connections dropped, no decodable TLS error"
-  say "  ${DIM}Your TLS library may not name the cause. Treat this as suspicious, not proven.${Z}"
+else
+  KIND=mtu_only
+  say "  ${G}0/$FULL_TOTAL uploads failed${Z} — but the MTU blackhole above is still real"
 fi
 say ""
 
-# --- 3. burst vs constant ---------------------------------------------------
-say "${B}[3/6]${Z} same payload, rate-capped at $SLOW_RATE → burst-triggered or constant?"
+if [ "$KIND" = mtu_only ]; then
+  BURST="not applicable"; PEER="not tested"; TUNNEL_NOTE="no tunnel active"; LOCAL_NOTE="not tested"
+else
+
+# --- 4. burst vs constant ---------------------------------------------------
+say "${B}[4/7]${Z} same payload, rate-capped at $SLOW_RATE → burst-triggered or constant?"
 PROBE_TIMEOUT=$SLOW_TIMEOUT
 run_round "slow     " --limit-rate "$SLOW_RATE" "$PRIMARY_URL"
 PROBE_TIMEOUT=$TIMEOUT
@@ -332,8 +410,8 @@ else
 fi
 say ""
 
-# --- 4. second peer ---------------------------------------------------------
-say "${B}[4/6]${Z} a different destination → is it just that one server?"
+# --- 5. second peer ---------------------------------------------------------
+say "${B}[5/7]${Z} a different destination → is it just that one server?"
 run_round "secondary" "$SECOND_URL"
 if [ "$RD_INVALID" -ge "$RD_TOTAL" ] || [ $((RD_OK + RD_BAD)) -eq 0 ]; then
   PEER="inconclusive — the second endpoint did not answer usefully"
@@ -346,11 +424,10 @@ else
 fi
 say ""
 
-# --- 5. bypass any tunnel ---------------------------------------------------
-PHYS=$(phys_iface)
+# --- 6. bypass any tunnel ---------------------------------------------------
 TUNNEL_NOTE="no tunnel active"
 if tunnel_active && [ -n "$PHYS" ]; then
-  say "${B}[5/6]${Z} tunnel is active — probing the physical link directly ($PHYS)"
+  say "${B}[6/7]${Z} tunnel is active — probing the physical link directly ($PHYS)"
   run_round "on $PHYS " --interface "$PHYS" "$PRIMARY_URL"
   if [ "$RD_BAD" -gt 0 ]; then
     TUNNEL_NOTE="physical link is bad; the tunnel is masking it"
@@ -360,14 +437,14 @@ if tunnel_active && [ -n "$PHYS" ]; then
     say "  ${DIM}the link underneath is clean — you can turn the tunnel off${Z}"
   fi
 else
-  say "${B}[5/6]${Z} ${DIM}skipped — no tunnel/exit node detected${Z}"
+  say "${B}[6/7]${Z} ${DIM}skipped — no tunnel/exit node detected${Z}"
 fi
 say ""
 
-# --- 6. clear the local machine --------------------------------------------
+# --- 7. clear the local machine --------------------------------------------
 LOCAL_NOTE="not tested"
 if [ -n "$LAN_PEER" ] && [ -n "$SHA" ] && [ -z "${PATHROT_FAKE:-}" ]; then
-  say "${B}[6/6]${Z} LAN-only transfer to $LAN_PEER → is it your own NIC?"
+  say "${B}[7/7]${Z} LAN-only transfer to $LAN_PEER → is it your own NIC?"
   LANFILE="$TMPDIR_/lan.bin"
   head -c $((8 * 1024 * 1024)) /dev/urandom > "$LANFILE"
   WANT=$($SHA "$LANFILE" | awk '{print $1}')
@@ -384,60 +461,95 @@ if [ -n "$LAN_PEER" ] && [ -n "$SHA" ] && [ -z "${PATHROT_FAKE:-}" ]; then
     say "  ${R}8MB arrived altered${Z} — the damage starts before it leaves your LAN"
   fi
 else
-  say "${B}[6/6]${Z} ${DIM}skipped — pass --lan-peer user@host to clear your own NIC${Z}"
+  say "${B}[7/7]${Z} ${DIM}skipped — pass --lan-peer user@host to clear your own NIC${Z}"
 fi
 say ""
+
+fi  # end of the upload-fault rounds
 
 # ------------------------------------------------------------------ verdict --
 
 say "${B}────────────────────────────────────────────────${Z}"
-if [ "$KIND" = corruption ]; then
-  say "${B}verdict${Z}  ${R}this path is corrupting your uploads${Z}"
+case "$KIND" in
+  corruption) say "${B}verdict${Z}  ${R}this path is corrupting your uploads${Z}" ;;
+  resets)     say "${B}verdict${Z}  ${Y}this path is dropping your uploads${Z} ${DIM}(cause not confirmed)${Z}" ;;
+  mtu_only)   say "${B}verdict${Z}  ${Y}path MTU blackhole${Z}" ;;
+esac
+say ""
+if [ "$MTU_STATE" = blackhole ]; then
+  say "  path MTU          ${R}${PATH_MTU}, below your interface's ${IF_MTU}${Z}"
 else
-  say "${B}verdict${Z}  ${Y}this path is dropping your uploads${Z} ${DIM}(cause not confirmed)${Z}"
+  say "  path MTU          ${PATH_MTU:-unknown} (interface ${IF_MTU:-?})"
+fi
+if [ "$KIND" != mtu_only ]; then
+  say "  failure rate      $FULL_BAD/$FULL_TOTAL uploads (${FULL_PCT}%)"
+  say "  with TLS error    $FULL_CORRUPT   ${DIM}(integrity failure — proof of alteration)${Z}"
+  say "  bare resets       $FULL_RESET   ${DIM}(consistent with either fault, proof of neither)${Z}"
+  say "  character         $BURST"
+  say "  scope             $PEER"
+  say "  local send path   $LOCAL_NOTE"
+  [ "$TUNNEL_NOTE" != "no tunnel active" ] && say "  tunnel            $TUNNEL_NOTE"
 fi
 say ""
-say "  failure rate      $FULL_BAD/$FULL_TOTAL uploads (${FULL_PCT}%)"
-say "  with TLS error    $FULL_CORRUPT   ${DIM}(integrity failure — proof of corruption)${Z}"
-say "  bare resets       $FULL_RESET   ${DIM}(consistent with corruption, not proof)${Z}"
-say "  character         $BURST"
-say "  scope             $PEER"
-say "  local send path   $LOCAL_NOTE"
-[ "$TUNNEL_NOTE" != "no tunnel active" ] && say "  tunnel            $TUNNEL_NOTE"
-say ""
 
-PACKETS=$(( PAYLOAD_BYTES / 1448 ))
-if [ "$FULL_BAD" -lt "$FULL_TOTAL" ] && [ "$PACKETS" -gt 0 ]; then
-  ONE_IN=$(awk -v ok=$((FULL_TOTAL - FULL_BAD)) -v n="$FULL_TOTAL" -v pk="$PACKETS" \
-    'BEGIN{ s=ok/n; if(s<=0||s>=1){exit} p=exp(log(s)/pk); printf "%.0f", 1/(1-p) }')
-  if [ -n "$ONE_IN" ]; then
-    say "  ${DIM}≈ 1 packet in $ONE_IN is being altered (rough: assumes a 1448-byte MSS)."
-    say "  Stone & Partridge (SIGCOMM 2000) measured 1 in 1,100 – 32,000 in the wild.${Z}"
-    say ""
+if [ "$KIND" = corruption ]; then
+  PACKETS=$(( PAYLOAD_BYTES / 1448 ))
+  if [ "$FULL_BAD" -lt "$FULL_TOTAL" ] && [ "$PACKETS" -gt 0 ]; then
+    ONE_IN=$(awk -v ok=$((FULL_TOTAL - FULL_BAD)) -v n="$FULL_TOTAL" -v pk="$PACKETS" \
+      'BEGIN{ s=ok/n; if(s<=0||s>=1){exit} p=exp(log(s)/pk); printf "%.0f", 1/(1-p) }')
+    if [ -n "$ONE_IN" ]; then
+      say "  ${DIM}≈ 1 packet in $ONE_IN is being altered (rough: assumes a 1448-byte MSS)."
+      say "  Stone & Partridge (SIGCOMM 2000) measured 1 in 1,100 – 32,000 in the wild.${Z}"
+      say ""
+    fi
   fi
 fi
 
 say "${B}what to do${Z}"
-if [ "$LOCAL_NOTE" = "local send path is corrupting" ]; then
-  say "  The damage starts on this machine. Try disabling TCP segmentation offload:"
-  say "    macOS  sudo sysctl -w net.inet.tcp.tso=0"
-  say "    Linux  sudo ethtool -K <iface> tso off gso off"
-else
-  say "  Nothing local can repair damage that happens upstream — you can only"
-  say "  route around it:"
+say ""
+if [ "$MTU_STATE" = blackhole ]; then
+  say "  ${B}Lower your MTU first.${Z} It is local, free, and reversible:"
+  say "    macOS  sudo networksetup -setMTU Wi-Fi $((PATH_MTU - 20))"
+  say "    Linux  sudo ip link set $PHYS mtu $((PATH_MTU - 20))"
+  say "  Then re-run pathrot. If the uploads still fail, keep reading."
   say ""
-  say "    ${B}1. Tunnel out.${Z} WireGuard/Tailscale authenticate every packet, so a"
-  say "       damaged packet is dropped and TCP simply retransmits it. Corruption"
-  say "       becomes ordinary packet loss, which TCP has always handled."
-  say "    ${B}2. Change networks.${Z} Phone hotspot, wired, a different AP."
-  if [ "$BURST" = "burst-triggered" ]; then
-    say "    ${B}3. Rate-limit.${Z} This path was clean at $SLOW_RATE — usually as slow as"
-    say "       tunnelling, for less reliability, but it needs no infrastructure."
+fi
+if [ "$KIND" = corruption ]; then
+  say "  Lowering the MTU will ${B}not${Z} fix the corruption — dropped packets and"
+  say "  altered packets are different faults, and TLS proved alteration here."
+  say ""
+  if [ "$LOCAL_NOTE" = "local send path is corrupting" ]; then
+    say "  The damage starts on this machine. Try disabling segmentation offload:"
+    say "    macOS  sudo sysctl -w net.inet.tcp.tso=0"
+    say "    Linux  sudo ethtool -K $PHYS tso off gso off"
+  else
+    say "  The damage happens upstream, so nothing local repairs it — route around:"
+    say ""
+    say "    ${B}1. Tunnel out.${Z} WireGuard/Tailscale authenticate every packet, so a"
+    say "       damaged packet is dropped and TCP simply retransmits it. Corruption"
+    say "       becomes ordinary packet loss, which TCP has always handled."
+    say "    ${B}2. Change networks.${Z} Phone hotspot, wired, a different AP."
+    [ "$BURST" = "burst-triggered" ] && \
+    say "    ${B}3. Rate-limit.${Z} This path was clean at $SLOW_RATE."
   fi
+elif [ "$KIND" = resets ]; then
+  say "  The cause is not proven. In order of how often they turn out to be right:"
+  say "    1. lower the MTU (see above, or try 1400 by hand if ICMP was blocked)"
+  say "    2. tunnel out — fixes corruption, and masks an MTU problem too"
+  say "    3. try a different network to confirm the path is at fault at all"
 fi
 say ""
 
-[ "$JSON" -eq 1 ] && printf '{"verdict":"%s","corrupt":%d,"reset":%d,"samples":%d,"failure_pct":%d,"character":"%s","scope":"%s","local":"%s","tunnel":"%s"}\n' \
-  "$([ "$KIND" = corruption ] && echo corrupting || echo dropping)" \
-  "$FULL_CORRUPT" "$FULL_RESET" "$FULL_TOTAL" "$FULL_PCT" "$BURST" "$PEER" "$LOCAL_NOTE" "$TUNNEL_NOTE"
+# Assigned before the printf: a case statement's `)` terminates a $( ... )
+# substitution early, which silently emitted the script's own source as the
+# verdict string. --json only, so only the test suite ever saw it.
+case "$KIND" in
+  corruption) JSON_VERDICT=corrupting ;;
+  resets)     JSON_VERDICT=dropping ;;
+  *)          JSON_VERDICT=mtu_blackhole ;;
+esac
+[ "$JSON" -eq 1 ] && printf '{"verdict":"%s","mtu":"%s","path_mtu":"%s","if_mtu":"%s","corrupt":%d,"reset":%d,"samples":%d,"failure_pct":%d,"character":"%s","scope":"%s","local":"%s","tunnel":"%s"}\n' \
+  "$JSON_VERDICT" \
+  "$MTU_STATE" "$PATH_MTU" "${IF_MTU:-}" "$FULL_CORRUPT" "$FULL_RESET" "$FULL_TOTAL" "$FULL_PCT" \
+  "$BURST" "$PEER" "$LOCAL_NOTE" "$TUNNEL_NOTE"
 exit 1
