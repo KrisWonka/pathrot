@@ -11,13 +11,13 @@ On some paths it does not.
 ```
 $ pathrot
 
-[1/6] baseline reachability
-  ok  tcp 9ms · tls 22ms · download 14.2 MB/s
+[1/6] baseline — is the endpoint usable at all?
+  ok  tcp 9ms · tls 22ms · download 14.2 MB/s · endpoint accepts full uploads
 
-[2/6] full-speed uploads → is anything corrupting them?
-  primary   ..!.!..!.!!.  5/12 corrupt
+[2/6] full-speed uploads → is anything damaging them?
+  primary   ..!.!..!.!!.  5/12 failed
 
-  5/12 corrupted (41%) — TLS reported bad record mac
+  5/12 failed (41%) — 5 with a TLS integrity error
 ...
 verdict  this path is corrupting your uploads
 ```
@@ -86,7 +86,7 @@ The value is not the detection — it is the **attribution ladder**, which is wh
 
 | Round | What it separates |
 | --- | --- |
-| 1. baseline handshake + download | is the network simply down or slow? |
+| 1. baseline + endpoint check | is the network down, and does the endpoint actually read a whole body? |
 | 2. full-speed uploads × N | measure the corruption rate |
 | 3. same payload, rate-capped | burst-triggered, or constant? |
 | 4. a second destination | is it just that one server? |
@@ -168,15 +168,50 @@ retransmits its own losses, with no tunnel required. If your client can speak HT
 4. **If round 6 convicted your own machine**, disable TCP segmentation offload and re-run:
    `sudo sysctl -w net.inet.tcp.tso=0` (macOS) or `sudo ethtool -K <iface> tso off gso off` (Linux).
 
-## Caveats
+## Two verdicts, and the difference matters
 
-- **Probes cost bandwidth.** Default settings upload roughly 18 MB per run to a public
-  speed-test endpoint. Use `-q`, or point `PATHROT_URL` at your own server, on metered links.
-- **The fault is intermittent.** A clean run does not prove a clean path. If your application
-  is failing right now and pathrot says clean, re-run with `-n 32`.
-- **Round 6 needs a peer.** Without `--lan-peer` pathrot cannot fully rule out your own NIC.
-- **Public endpoints are a courtesy.** Don't run this on a loop against Cloudflare or httpbin;
-  set `PATHROT_URL` to something you own if you want continuous monitoring.
+pathrot separates what it can prove from what it can only suspect.
+
+**`corrupting`** — at least one probe died with a TLS integrity error
+(`bad record mac`, `decryption failed`, and the equivalents in other TLS
+libraries). That is proof: the ciphertext that arrived is not the ciphertext
+that was sent.
+
+**`dropping`** — probes died, but your TLS library did not name the cause.
+Corruption produces this too, since not every stack reports the integrity
+failure in a greppable way, and a middlebox can also just send a reset. This is
+the same symptom you see as `ECONNRESET`. pathrot reports it and says plainly
+that the cause is not confirmed.
+
+A path that only times out is neither. It is slow, not damaged, and pathrot
+says so rather than manufacturing a finding.
+
+## Limitations
+
+**Read this before trusting a result.**
+
+- **The fault is intermittent.** A clean run does not prove a clean path. In the
+  case that prompted this tool the failure rate drifted between 17% and 75%
+  over a single day, with clean windows in between. If your application is
+  failing now and pathrot says clean, re-run with `-n 32`.
+- **Probes cost bandwidth.** The defaults upload roughly 18 MB per run to a
+  public speed-test endpoint. Use `-q`, or point `PATHROT_URL` at your own
+  server, on metered links. Do not run this on a loop against Cloudflare or
+  httpbin.
+- **Round 6 needs a peer.** Without `--lan-peer` pathrot cannot rule out your
+  own NIC, and will say `not tested` rather than guess.
+- **Round 5 is best-effort on Linux.** `curl --interface` sets the source
+  address, which is enough to bypass a tunnel on macOS and on Tailscale's
+  default routing, but a WireGuard setup using policy routing may still send
+  the probe through the tunnel. Treat a clean round 5 on Linux with suspicion.
+- **The per-packet estimate is rough.** It assumes a 1448-byte MSS and
+  independent, uniformly distributed damage. Real corruption is bursty. Use it
+  as an order of magnitude, not a measurement.
+- **Field-tested on one bad path.** The detection ladder was derived from, and
+  validated against, a single genuinely corrupting network (~28% failure rate,
+  reproduced from two independent machines). Every other behaviour is covered
+  by the offline test suite. If pathrot gets your path wrong, that is worth an
+  issue — including a false clean.
 
 ## Development
 
@@ -184,8 +219,11 @@ retransmits its own losses, with no tunnel required. If your client can speak HT
 ./test.sh
 ```
 
-Tests use the `PATHROT_FAKE` seam (a string of `.` ok / `!` corrupt / `~` timeout characters
-replayed in place of real probes), so the suite runs offline and deterministically.
+Most tests use the `PATHROT_FAKE` seam — a string of verdict characters
+(`.` ok, `!` corrupt, `r` reset, `~` timeout, `i` invalid) replayed in place of real
+probes — so the suite is deterministic and runs offline. Two tests do hit the network,
+to check that pathrot refuses an endpoint which will not read a whole request body;
+skip them with `PATHROT_SKIP_NET=1`.
 
 ## Prior art and reading
 
