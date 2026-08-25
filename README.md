@@ -57,7 +57,7 @@ altering your data, and then attributes the damage to a layer.
 ## Quick start
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/OWNER/pathrot/main/pathrot -o /usr/local/bin/pathrot
+curl -fsSL https://raw.githubusercontent.com/KrisWonka/pathrot/main/pathrot -o /usr/local/bin/pathrot
 chmod +x /usr/local/bin/pathrot
 pathrot
 ```
