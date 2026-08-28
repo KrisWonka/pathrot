@@ -20,7 +20,7 @@
 
 set -uo pipefail
 
-VERSION=0.3.0
+VERSION=0.4.0
 
 # ---------------------------------------------------------------- defaults --
 
@@ -194,6 +194,37 @@ tunnel_active() {
   tailscale debug prefs 2>/dev/null | grep -q '"ExitNodeID": "[^"]\{1,\}"'
 }
 
+
+# ----------------------------------------------------------------- DNS ----
+
+# Which resolvers is this machine actually using?
+resolvers() {
+  case "$(uname -s)" in
+    Darwin) scutil --dns 2>/dev/null | awk '/nameserver\[/{print $3}' | sort -u | tr '\n' ' ' ;;
+    Linux)  { resolvectl status 2>/dev/null | sed -n 's/.*DNS Servers: //p'
+              awk '/^nameserver/{print $2}' /etc/resolv.conf 2>/dev/null; } |
+            tr '\n' ' ' | tr -s ' ' ;;
+  esac
+}
+
+host_of() { printf '%s' "$1" | sed -e 's|^[a-z][a-z]*://||' -e 's|[/?].*$||' -e 's|:[0-9]*$||'; }
+
+# resolve <host> [server]
+resolve() {
+  if [ -n "${2:-}" ]; then
+    dig +short +time=3 +tries=1 "@$2" "$1" A 2>/dev/null | awk '/^[0-9.]+$/{print; exit}'
+  else
+    dig +short +time=3 +tries=1 "$1" A 2>/dev/null | awk '/^[0-9.]+$/{print; exit}'
+  fi
+}
+
+# connect_ms <host> <ip> — TCP+TLS setup time to that specific address
+connect_ms() {
+  curl -sS -o /dev/null --connect-timeout 8 --max-time 15 \
+       -w '%{time_connect}' --resolve "$1:443:$2" "https://$1/" 2>/dev/null |
+    awk '{printf "%.0f", $1*1000}'
+}
+
 # ------------------------------------------------------------- path MTU ----
 
 PING_SRC=""
@@ -305,8 +336,54 @@ PHYS=$(phys_iface)
 PING_SRC=$(iface_ip "$PHYS")
 IF_MTU=$(iface_mtu "$PHYS")
 
-# --- 1. baseline, and prove the endpoint is usable --------------------------
-say "${B}[1/7]${Z} baseline — is the endpoint usable at all?"
+# --- 1. DNS ------------------------------------------------------------------
+# Checked before anything else, because a resolver that answers with a far-away
+# CDN edge silently puts every later measurement on the wrong path — and no
+# amount of probing the link will show you that the link was not the problem.
+say "${B}[1/8]${Z} DNS — is your resolver sending you somewhere sensible?"
+DNS_STATE=unknown; DNS_NOTE=""
+PHOST=$(host_of "$PRIMARY_URL")
+if [ -n "${PATHROT_FAKE_DNS:-}" ]; then
+  DNS_STATE=$PATHROT_FAKE_DNS
+  case "$DNS_STATE" in
+    detour) DNS_NOTE="system resolver 240ms vs 1.1.1.1 35ms (fake)" ;;
+    *)      DNS_NOTE="ok (fake)" ;;
+  esac
+elif ! command -v dig >/dev/null 2>&1; then
+  DNS_STATE=skipped; DNS_NOTE="dig not installed"
+else
+  RES=$(resolvers)
+  SYS_IP=$(resolve "$PHOST")
+  REF_IP=$(resolve "$PHOST" 1.1.1.1)
+  say "  ${DIM}resolvers: ${RES:-unknown}${Z}"
+  if [ -z "$SYS_IP" ]; then
+    DNS_STATE=skipped; DNS_NOTE="could not resolve $PHOST"
+  elif [ -z "$REF_IP" ] || [ "$SYS_IP" = "$REF_IP" ]; then
+    DNS_STATE=ok; DNS_NOTE="$PHOST -> $SYS_IP"
+  else
+    SYS_MS=$(connect_ms "$PHOST" "$SYS_IP"); REF_MS=$(connect_ms "$PHOST" "$REF_IP")
+    : "${SYS_MS:=0}"; : "${REF_MS:=0}"
+    if [ "$SYS_MS" -gt 120 ] && [ "$SYS_MS" -gt $((REF_MS + 80)) ]; then
+      DNS_STATE=detour
+      DNS_NOTE="your resolver -> $SYS_IP (${SYS_MS}ms), 1.1.1.1 -> $REF_IP (${REF_MS}ms)"
+    else
+      DNS_STATE=ok; DNS_NOTE="$PHOST -> $SYS_IP (${SYS_MS}ms)"
+    fi
+  fi
+fi
+case "$DNS_STATE" in
+  detour)
+    say "  ${R}your resolver is routing you the long way round${Z}"
+    say "  ${DIM}$DNS_NOTE${Z}"
+    say "  ${DIM}A far edge means every packet crosses more middleboxes, which is where"
+    say "  both of the faults below actually happen. Fix this before blaming the link.${Z}" ;;
+  ok)      say "  ${G}ok${Z}  $DNS_NOTE" ;;
+  skipped) say "  ${Y}skipped — $DNS_NOTE${Z}" ;;
+esac
+say ""
+
+# --- 2. baseline, and prove the endpoint is usable --------------------------
+say "${B}[2/8]${Z} baseline — is the endpoint usable at all?"
 if [ -n "${PATHROT_FAKE:-}" ]; then
   CONNECT_MS=10; TLS_MS=20; DOWN_MBPS=14.2
 else
@@ -327,11 +404,11 @@ fi
 say "  ${G}ok${Z}  tcp ${CONNECT_MS}ms · tls ${TLS_MS}ms · download ${DOWN_MBPS} MB/s · endpoint accepts full uploads"
 say ""
 
-# --- 2. path MTU ------------------------------------------------------------
+# --- 3. path MTU ------------------------------------------------------------
 # The most commonly confirmed cause of this symptom, and the cheapest to fix,
 # so it goes before anything expensive. Probed from the physical interface so
 # a tunnel's own 1280-byte MTU is not mistaken for a blackhole.
-say "${B}[2/7]${Z} path MTU — are large packets being dropped outright?"
+say "${B}[3/8]${Z} path MTU — are large packets being dropped outright?"
 MTU_STATE=unknown; PATH_MTU=""
 if [ -n "${PATHROT_FAKE_MTU:-}" ]; then
   PATH_MTU=$PATHROT_FAKE_MTU; IF_MTU=${IF_MTU:-1500}
@@ -357,8 +434,8 @@ else
 fi
 say ""
 
-# --- 3. full-speed uploads --------------------------------------------------
-say "${B}[3/7]${Z} full-speed uploads → is anything damaging them?"
+# --- 4. full-speed uploads --------------------------------------------------
+say "${B}[4/8]${Z} full-speed uploads → is anything damaging them?"
 run_round "primary  " "$PRIMARY_URL"
 FULL_CORRUPT=$RD_CORRUPT; FULL_RESET=$RD_RESET; FULL_TOTAL=$RD_TOTAL
 FULL_TIMEOUT=$RD_TIMEOUT; FULL_INVALID=$RD_INVALID
@@ -370,15 +447,15 @@ say ""
   die "  most probes were invalid — the endpoint stopped consuming the body.
   Results would be meaningless; set PATHROT_URL to a server you control."
 
-if [ "$FULL_BAD" -eq 0 ] && [ "$MTU_STATE" != blackhole ]; then
+if [ "$FULL_BAD" -eq 0 ] && [ "$MTU_STATE" != blackhole ] && [ "$DNS_STATE" != detour ]; then
   say "${B}verdict${Z}  ${G}path looks clean${Z} — 0/$FULL_TOTAL uploads failed, no MTU blackhole"
   [ "$FULL_TIMEOUT" -gt 0 ] && \
     say "  ${DIM}($FULL_TIMEOUT timed out — the link is slow, but not damaging data)${Z}"
   say ""
   say "  ${DIM}This fault is intermittent. If your application is failing right now"
   say "  and this run is clean, re-run with -n 32 to sample a longer window.${Z}"
-  [ "$JSON" -eq 1 ] && printf '{"verdict":"clean","mtu":"%s","path_mtu":"%s","corrupt":0,"reset":0,"samples":%d}\n' \
-    "$MTU_STATE" "$PATH_MTU" "$FULL_TOTAL"
+  [ "$JSON" -eq 1 ] && printf '{"verdict":"clean","dns":"%s","mtu":"%s","path_mtu":"%s","corrupt":0,"reset":0,"samples":%d}\n' \
+    "$DNS_STATE" "$MTU_STATE" "$PATH_MTU" "$FULL_TOTAL"
   exit 0
 fi
 
@@ -390,7 +467,7 @@ elif [ "$FULL_BAD" -gt 0 ]; then
   say "  ${R}$FULL_BAD/$FULL_TOTAL failed (${FULL_PCT}%)${Z} — connections dropped, no decodable TLS error"
 else
   KIND=mtu_only
-  say "  ${G}0/$FULL_TOTAL uploads failed${Z} — but the MTU blackhole above is still real"
+  say "  ${G}0/$FULL_TOTAL uploads failed${Z} — but the problem flagged above is still real"
 fi
 say ""
 
@@ -398,8 +475,8 @@ if [ "$KIND" = mtu_only ]; then
   BURST="not applicable"; PEER="not tested"; TUNNEL_NOTE="no tunnel active"; LOCAL_NOTE="not tested"
 else
 
-# --- 4. burst vs constant ---------------------------------------------------
-say "${B}[4/7]${Z} same payload, rate-capped at $SLOW_RATE → burst-triggered or constant?"
+# --- 5. burst vs constant ---------------------------------------------------
+say "${B}[5/8]${Z} same payload, rate-capped at $SLOW_RATE → burst-triggered or constant?"
 PROBE_TIMEOUT=$SLOW_TIMEOUT
 run_round "slow     " --limit-rate "$SLOW_RATE" "$PRIMARY_URL"
 PROBE_TIMEOUT=$TIMEOUT
@@ -410,8 +487,8 @@ else
 fi
 say ""
 
-# --- 5. second peer ---------------------------------------------------------
-say "${B}[5/7]${Z} a different destination → is it just that one server?"
+# --- 6. second peer ---------------------------------------------------------
+say "${B}[6/8]${Z} a different destination → is it just that one server?"
 run_round "secondary" "$SECOND_URL"
 if [ "$RD_INVALID" -ge "$RD_TOTAL" ] || [ $((RD_OK + RD_BAD)) -eq 0 ]; then
   PEER="inconclusive — the second endpoint did not answer usefully"
@@ -424,10 +501,10 @@ else
 fi
 say ""
 
-# --- 6. bypass any tunnel ---------------------------------------------------
+# --- 7. bypass any tunnel ---------------------------------------------------
 TUNNEL_NOTE="no tunnel active"
 if tunnel_active && [ -n "$PHYS" ]; then
-  say "${B}[6/7]${Z} tunnel is active — probing the physical link directly ($PHYS)"
+  say "${B}[7/8]${Z} tunnel is active — probing the physical link directly ($PHYS)"
   run_round "on $PHYS " --interface "$PHYS" "$PRIMARY_URL"
   if [ "$RD_BAD" -gt 0 ]; then
     TUNNEL_NOTE="physical link is bad; the tunnel is masking it"
@@ -437,14 +514,14 @@ if tunnel_active && [ -n "$PHYS" ]; then
     say "  ${DIM}the link underneath is clean — you can turn the tunnel off${Z}"
   fi
 else
-  say "${B}[6/7]${Z} ${DIM}skipped — no tunnel/exit node detected${Z}"
+  say "${B}[7/8]${Z} ${DIM}skipped — no tunnel/exit node detected${Z}"
 fi
 say ""
 
-# --- 7. clear the local machine --------------------------------------------
+# --- 8. clear the local machine --------------------------------------------
 LOCAL_NOTE="not tested"
 if [ -n "$LAN_PEER" ] && [ -n "$SHA" ] && [ -z "${PATHROT_FAKE:-}" ]; then
-  say "${B}[7/7]${Z} LAN-only transfer to $LAN_PEER → is it your own NIC?"
+  say "${B}[8/8]${Z} LAN-only transfer to $LAN_PEER → is it your own NIC?"
   LANFILE="$TMPDIR_/lan.bin"
   head -c $((8 * 1024 * 1024)) /dev/urandom > "$LANFILE"
   WANT=$($SHA "$LANFILE" | awk '{print $1}')
@@ -461,7 +538,7 @@ if [ -n "$LAN_PEER" ] && [ -n "$SHA" ] && [ -z "${PATHROT_FAKE:-}" ]; then
     say "  ${R}8MB arrived altered${Z} — the damage starts before it leaves your LAN"
   fi
 else
-  say "${B}[7/7]${Z} ${DIM}skipped — pass --lan-peer user@host to clear your own NIC${Z}"
+  say "${B}[8/8]${Z} ${DIM}skipped — pass --lan-peer user@host to clear your own NIC${Z}"
 fi
 say ""
 
@@ -476,6 +553,11 @@ case "$KIND" in
   mtu_only)   say "${B}verdict${Z}  ${Y}path MTU blackhole${Z}" ;;
 esac
 say ""
+if [ "$DNS_STATE" = detour ]; then
+  say "  dns               ${R}resolver is sending you to a far edge${Z}"
+else
+  say "  dns               ${DNS_STATE}"
+fi
 if [ "$MTU_STATE" = blackhole ]; then
   say "  path MTU          ${R}${PATH_MTU}, below your interface's ${IF_MTU}${Z}"
 else
@@ -507,6 +589,15 @@ fi
 
 say "${B}what to do${Z}"
 say ""
+if [ "$DNS_STATE" = detour ]; then
+  say "  ${B}Fix your DNS first.${Z} $DNS_NOTE"
+  say "  A resolver in the wrong part of the world hands you the wrong CDN edge, and"
+  say "  everything below is then measuring a path you should not be on at all."
+  say "    macOS  networksetup -setdnsservers Wi-Fi 1.1.1.1 8.8.8.8"
+  say "    Linux  set your resolver in NetworkManager / systemd-resolved"
+  say "  Then re-run pathrot."
+  say ""
+fi
 if [ "$MTU_STATE" = blackhole ]; then
   say "  ${B}Lower your MTU first.${Z} It is local, free, and reversible:"
   say "    macOS  sudo networksetup -setMTU Wi-Fi $((PATH_MTU - 20))"
@@ -548,8 +639,8 @@ case "$KIND" in
   resets)     JSON_VERDICT=dropping ;;
   *)          JSON_VERDICT=mtu_blackhole ;;
 esac
-[ "$JSON" -eq 1 ] && printf '{"verdict":"%s","mtu":"%s","path_mtu":"%s","if_mtu":"%s","corrupt":%d,"reset":%d,"samples":%d,"failure_pct":%d,"character":"%s","scope":"%s","local":"%s","tunnel":"%s"}\n' \
+[ "$JSON" -eq 1 ] && printf '{"verdict":"%s","dns":"%s","mtu":"%s","path_mtu":"%s","if_mtu":"%s","corrupt":%d,"reset":%d,"samples":%d,"failure_pct":%d,"character":"%s","scope":"%s","local":"%s","tunnel":"%s"}\n' \
   "$JSON_VERDICT" \
-  "$MTU_STATE" "$PATH_MTU" "${IF_MTU:-}" "$FULL_CORRUPT" "$FULL_RESET" "$FULL_TOTAL" "$FULL_PCT" \
+  "$DNS_STATE" "$MTU_STATE" "$PATH_MTU" "${IF_MTU:-}" "$FULL_CORRUPT" "$FULL_RESET" "$FULL_TOTAL" "$FULL_PCT" \
   "$BURST" "$PEER" "$LOCAL_NOTE" "$TUNNEL_NOTE"
 exit 1

@@ -3,26 +3,33 @@
 **Your uploads keep failing with `ECONNRESET`, and every tool says the network is fine.
 There are two very different reasons for that, and they need opposite fixes.**
 
-| | what happens to a large packet | the fix |
+| | what goes wrong | the fix |
 | --- | --- | --- |
-| **path MTU blackhole** | it is **dropped**, silently, with no ICMP back | lower your MTU |
-| **path corruption** | it is **altered**, and TCP cannot tell | tunnel out |
+| **DNS detour** | your resolver hands you a CDN edge on the wrong continent, so every packet crosses far more of the internet than it should | fix your resolver |
+| **path MTU blackhole** | large packets are **dropped**, silently, with no ICMP back | lower your MTU |
+| **path corruption** | large packets are **altered**, and TCP cannot tell | tunnel out |
 
-Lowering the MTU does nothing for corruption. Tunnelling masks both, at the cost of the
-tunnel's bandwidth. Guessing between them is how people lose days to this.
+The fixes do not transfer. Lowering the MTU does nothing for corruption; tunnelling masks
+both of the last two while costing bandwidth; and if your DNS is wrong, everything you
+measure afterwards is a path you should not be on at all. Guessing between them is how
+people lose days to this.
 
-pathrot measures both and tells you which one you have.
+pathrot checks all three and tells you which one you have.
 
 ```
 $ pathrot
 
-[1/7] baseline — is the endpoint usable at all?
+[1/8] DNS — is your resolver sending you somewhere sensible?
+  resolvers: 1.1.1.1 8.8.8.8
+  ok  api.anthropic.com -> 160.79.104.10 (9ms)
+
+[2/8] baseline — is the endpoint usable at all?
   ok  tcp 9ms · tls 22ms · download 14.2 MB/s · endpoint accepts full uploads
 
-[2/7] path MTU — are large packets being dropped outright?
+[3/8] path MTU — are large packets being dropped outright?
   ok  path MTU 1500 on en0 (interface 1500) — no blackhole
 
-[3/7] full-speed uploads → is anything damaging them?
+[4/8] full-speed uploads → is anything damaging them?
   primary   ..!.!..!.!!.  5/12 failed
 
   5/12 failed (41%) — 5 with a TLS integrity error
@@ -78,7 +85,7 @@ pathrot --json                       # machine-readable, for scripting
 
 Exit status: `0` clean · `1` a fault was found · `2` could not run a valid test.
 
-## Two faults, one symptom
+## Three faults, one symptom
 
 **An MTU blackhole** means something on the path cannot carry packets as large as your
 interface is emitting, and drops them without sending back the ICMP "fragmentation needed"
@@ -89,6 +96,12 @@ setting their MTU to 1492, 1460 or 1400 until things start working.
 
 **Path corruption** means the bytes arrive, but not the bytes you sent. This one is rarer
 and much less known, because TCP is supposed to make it impossible — see below.
+
+**A DNS detour** is upstream of both. If your resolver is in the wrong part of the world it
+will answer CDN hostnames with edges near *itself*, not near you, and your traffic then
+crosses far more of the internet than it needs to — more hops, more middleboxes, more
+opportunity for either of the other two faults to bite. It is easy to miss because DNS
+resolution itself keeps working perfectly; only the destination is wrong.
 
 They look identical from the application. pathrot separates them by measuring the path MTU
 directly (round 2) and by reading *how* the uploads die (round 3): a dropped packet
@@ -106,13 +119,21 @@ this fix".
 
 | Round | What it separates |
 | --- | --- |
-| 1. baseline + endpoint check | is the network down, and does the endpoint actually read a whole body? |
-| 2. path MTU, from the physical interface | are large packets simply being dropped? |
-| 3. full-speed uploads × N | the failure rate, and whether TLS blames integrity |
-| 4. same payload, rate-capped | burst-triggered, or constant? |
-| 5. a second destination | is it just that one server? |
-| 6. bound to the physical interface | probes the real link even when a tunnel is masking it |
-| 7. LAN-only transfer to a peer | **your own NIC/driver, or something upstream?** |
+| 1. DNS | is your resolver even pointing you at a nearby edge? |
+| 2. baseline + endpoint check | is the network down, and does the endpoint actually read a whole body? |
+| 3. path MTU, from the physical interface | are large packets simply being dropped? |
+| 4. full-speed uploads × N | the failure rate, and whether TLS blames integrity |
+| 5. same payload, rate-capped | burst-triggered, or constant? |
+| 6. a second destination | is it just that one server? |
+| 7. bound to the physical interface | probes the real link even when a tunnel is masking it |
+| 8. LAN-only transfer to a peer | **your own NIC/driver, or something upstream?** |
+
+Round 1 is first for a reason learned the hard way. A machine in Michigan configured with a
+public resolver on another continent will be handed CDN edges on that continent, and then
+every later measurement describes a path the traffic should never have been on. pathrot
+resolves the target with your resolver and with `1.1.1.1`, and compares how long it takes to
+reach each answer — no geolocation service, no external dependency. If yours is much further
+away, that is reported before anything else, because it invalidates everything after it.
 
 Rounds 2 and 6 both source from the physical interface on purpose. When a tunnel is up the
 default route points at the tunnel, whose own MTU is typically 1280 — measure through that
@@ -182,7 +203,7 @@ packet loss is what TCP has been designed to handle since 1981.
 The same reasoning is why QUIC/HTTP-3 is naturally immune: it authenticates per packet and
 retransmits its own losses, no tunnel required. If your client can speak HTTP/3, try that first.
 
-## Three verdicts
+## Four verdicts
 
 pathrot separates what it can prove from what it can only suspect.
 
@@ -198,6 +219,10 @@ unconfirmed, and ranks the fixes by how often each turns out to be right.
 **`mtu_blackhole`** — the path cannot carry packets as large as your interface emits.
 Reported even when every upload happens to succeed, because it will bite later.
 
+**a DNS detour** is reported alongside any of the above, and moves to the top of the remedy
+list when present. A run with clean uploads is still not reported as clean if your resolver
+is sending you the long way round.
+
 A path that only times out is none of these. It is slow, not broken, and pathrot says so
 rather than manufacturing a finding.
 
@@ -212,6 +237,7 @@ rather than manufacturing a finding.
 - **Probes cost bandwidth.** The defaults upload roughly 18 MB per run to a public
   speed-test endpoint. Use `-q`, or point `PATHROT_URL` at your own server, on metered
   links. Do not run this on a loop against Cloudflare or httpbin.
+- **The DNS round needs `dig`.** Without it that round is skipped and says so.
 - **The MTU round needs ICMP.** If echo replies are blocked, pathrot says so and tells you
   to try lowering the MTU by hand rather than guessing.
 - **Round 7 needs a peer.** Without `--lan-peer` pathrot cannot rule out your own NIC, and

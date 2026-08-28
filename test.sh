@@ -55,6 +55,21 @@ case "$IFACE" in
 esac
 echo
 
+echo "─ DNS detour"
+# Checked first because it invalidates everything after it: a resolver handing
+# you a far CDN edge means the later rounds are measuring a path you should not
+# be on. A clean-uploads run must still fail if DNS is sending you the long way.
+expect_exit 1 "exits 1 on a DNS detour even when uploads are clean" \
+  env PATHROT_FAKE='............' PATHROT_FAKE_DNS=detour ./pathrot -q
+expect_out "routing you the long way round" "names the detour"
+expect_out "Fix your DNS first" "leads the remedies with DNS"
+expect_no_out "path looks clean" "does not call a detoured path clean"
+
+expect_exit 0 "a healthy resolver does not trip the check" \
+  env PATHROT_FAKE='............' PATHROT_FAKE_DNS=ok ./pathrot -q
+expect_out "path looks clean" "clean when DNS and uploads are both fine"
+echo
+
 echo "─ MTU blackhole"
 # The most commonly confirmed cause of this symptom. It must be reported even
 # when every upload succeeds, and it must not be confused with a tunnel's own
