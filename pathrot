@@ -20,7 +20,7 @@
 
 set -uo pipefail
 
-VERSION=0.4.0
+VERSION=0.4.1
 
 # ---------------------------------------------------------------- defaults --
 
@@ -304,6 +304,7 @@ upload_once() {
   fi
 }
 
+ALL_CORRUPT=0
 run_round() {
   local label=$1; shift
   RD_OK=0; RD_CORRUPT=0; RD_RESET=0; RD_TIMEOUT=0; RD_INVALID=0; RD_TOTAL=$SAMPLES
@@ -321,6 +322,10 @@ run_round() {
     i=$((i+1))
   done
   RD_BAD=$((RD_CORRUPT + RD_RESET))
+  # A TLS integrity error is proof of alteration no matter which round finds it.
+  # Counting only the first round threw that proof away and led the remedies
+  # with "lower your MTU", which cannot fix alteration.
+  ALL_CORRUPT=$((ALL_CORRUPT + RD_CORRUPT))
   say "  ${DIM}${RD_BAD}/${RD_TOTAL} failed${Z}"
 }
 
@@ -546,6 +551,12 @@ fi  # end of the upload-fault rounds
 
 # ------------------------------------------------------------------ verdict --
 
+# Proof found in any later round upgrades the verdict.
+if [ "$ALL_CORRUPT" -gt 0 ] && [ "$KIND" != corruption ]; then
+  KIND=corruption
+  LATE_PROOF=$ALL_CORRUPT
+fi
+
 say "${B}────────────────────────────────────────────────${Z}"
 case "$KIND" in
   corruption) say "${B}verdict${Z}  ${R}this path is corrupting your uploads${Z}" ;;
@@ -565,7 +576,9 @@ else
 fi
 if [ "$KIND" != mtu_only ]; then
   say "  failure rate      $FULL_BAD/$FULL_TOTAL uploads (${FULL_PCT}%)"
-  say "  with TLS error    $FULL_CORRUPT   ${DIM}(integrity failure — proof of alteration)${Z}"
+  say "  with TLS error    $ALL_CORRUPT   ${DIM}(integrity failure — proof of alteration, all rounds)${Z}"
+  [ -n "${LATE_PROOF:-}" ] && \
+    say "                    ${DIM}none in the first round; found while probing further${Z}"
   say "  bare resets       $FULL_RESET   ${DIM}(consistent with either fault, proof of neither)${Z}"
   say "  character         $BURST"
   say "  scope             $PEER"

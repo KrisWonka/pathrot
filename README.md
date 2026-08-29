@@ -226,6 +226,10 @@ is sending you the long way round.
 A path that only times out is none of these. It is slow, not broken, and pathrot says so
 rather than manufacturing a finding.
 
+Proof is counted across every round, not just the first. A run can show nothing but bare
+resets at full speed and then catch TLS integrity errors while rate-capped; that still means
+alteration, and the verdict says so.
+
 ## Limitations
 
 **Read this before trusting a result.**

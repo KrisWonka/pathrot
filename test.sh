@@ -98,6 +98,19 @@ expect_out "both destinations affected" "rules out the peer when both endpoints 
 expect_out "Tunnel out" "recommends tunnelling"
 echo
 
+echo "─ proof found in a later round must still count"
+# Regression: a run whose first upload round shows only bare resets, but whose
+# rate-capped round catches TLS integrity errors, was reported as "cause not
+# confirmed" and told to lower the MTU — advice that cannot fix alteration.
+# '.....r' drives round 4, '!!...!' drives round 5.
+expect_exit 1 "corruption found in round 5 upgrades the verdict" \
+  env PATHROT_FAKE='.....r!!...!' ./pathrot -q
+expect_out "corrupting your uploads" "verdict is corruption, not dropping"
+expect_out "found while probing further" "says the proof came from a later round"
+expect_out "will not fix the corruption" "does not lead with the MTU remedy"
+expect_no_out "cause not confirmed" "no longer claims the cause is unproven"
+echo
+
 echo "─ corruption, constant"
 expect_exit 1 "exits 1 when failures survive rate-limiting" env PATHROT_FAKE='!.....' ./pathrot -q
 expect_out "constant" "classifies constant when the slow round still fails"
